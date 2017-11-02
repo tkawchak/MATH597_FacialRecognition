@@ -38,7 +38,7 @@ print('==>>> total trainning batch number: {}'.format(len(train_loader)))
 print('==>>> total testing batch number: {}'.format(len(test_loader)))
 
 
-class Loss(nn.Module):
+class Loss(torch.autograd):
 
     def __init__(self, margin, k, alpha, beta):
         super(Loss, self).__init__()
@@ -70,9 +70,11 @@ class Loss(nn.Module):
 
         # count the number of class labels and the number of data per class label
         unique_labels, counts = np.unique(labels, return_counts=True)
+        self.counts = counts
 
         # store the centers for each class (mean of data)
         centers = np.zeros((unique_labels.shape[0], features.shape[1]))
+        self.centers = centers
         # find the top k Euclidean distances for each class
         d = np.zeros((unique_labels.shape[0], self.k))
 
@@ -95,7 +97,8 @@ class Loss(nn.Module):
         l_intra = np.sum(l_r)
         self.l_intra = l_intra
         # compute the shortest distances among all feature centers
-        d_center = self.compute_min_dist(centers)
+        d_center, idx = self.compute_min_dist(centers)
+        self.inter_indices = idx
         # compute total inter-class loss
         l_inter = max(self.margin - d_center, 0)
         self.l_inter = l_inter
@@ -112,6 +115,7 @@ class Loss(nn.Module):
         # this can probably be done faster in a list comprehension
 
         # initialize an array of zeros and fill in pairwise distances
+        top_indices = np.zeros(
         num = features.shape[0]
         dists = np.zeros((num, num))
         for id_1 in range(num):
@@ -137,34 +141,51 @@ class Loss(nn.Module):
                 dist = np.linalg.norm(centers[id_1] - centers[id_2])
                 dists[id_1, id_2] = dist
 
-                # reshape the dists array to be 1D and then find where distances > 0
-                # why do we do where dist_array > 0???
-                dist_array = dists.reshape((1, -1))
-                dist_array = dist_array[np.where(dist_array > 0)]
+        # reshape the dists array to be 1D and then find where distances > 0
+        # why do we do where dist_array > 0???
+        dist_array = dists.reshape((1, -1))
+        dist_array = dist_array[np.where(dist_array > 0)]
 
         # return the minimum distance
         dist_array.sort()
-        return dist_array[0]
+        min_value = dist_array[0]
+        min_idx = [(col, row) for row in range(num) if min_value in dists[row] for col in range(num) if min_value == dists[row][col]][0]
+        return min_value, min_idx
 
     def backward(self, grad_out):
         """
         Compute the gradient with respect to input to layer
         """
-        grad_in = torch.FloatTensor(self.pred.size())
+
+        # *********************************************
+        # why isn't backward being called?????*********
+        # *********************************************
 
 
-        features = in_data[0].asnumpy()
-        labels = in_data[1].asnumpy().ravel().astype(np.int)
+        # *********************************************
+        # check this with torch.autograd.gradcheck !!!!
+        # *********************************************
 
-        unique_labels, counts = np.unique(labels, return_count=True)
+        grad_inter = torch.FloatTensor(self.pred.size())
+        grad_intra = torch.FloatTensor(self.pred.size())
 
-        centers = np.zeros((unique_labels.shape[0], self.k))
-        d = np.zeros((unique_labels.shape[0], self.k))
+        inter_indices = self.inter_indices
+        print(inter_indices.shape)
+        idx1 = inter_indices[0]
+        idx2 = inter_indices[1]
+        grad_inter[idx1] = 0.5 / (self.counts[idx1]) * np.abs(self.centers[idx1] - self.centers[idx2])
+        grad_inter[idx2] = 0.5 / (self.counts[idx2]) * np.abs(self.centers[idx2] - self.centers[idx1])
 
-        l_r = np.zeros
+        # compute intra class gradients with respect to xi, xj
+        # only nonzero for these two values
+        for idx in range(self.num_features):
+            grad_in[idx] = 2*self.k / np.pow(d[idx,:]*np.sum(d[idx,:]))
 
+        # compute inter class gradients with respect to xq, xr
+        # only nonzero for these two values
 
-
+        grad_in = self.alpha * grad_intra + self.beta * grad_inter
+        print(grad_in)
         return grad_in
 
     def name(self):
