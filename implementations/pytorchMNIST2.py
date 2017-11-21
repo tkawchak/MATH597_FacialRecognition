@@ -8,10 +8,9 @@ import torch.optim as optim
 import numpy as np
 
 # define some constants for the loss function
-MARGIN = 20000
-K = 2
-ALPHA = 0.5
-BETA = 0.5
+MARGIN = torch.autograd.Variable(torch.LongTensor([20000]))
+K = torch.autograd.Variable(torch.LongTensor([2]))
+ALPHA = torch.autograd.Variable(torch.FloatTensor([0.5]))
 
 
 ## load mnist dataset
@@ -38,16 +37,16 @@ print('==>>> total trainning batch number: {}'.format(len(train_loader)))
 print('==>>> total testing batch number: {}'.format(len(test_loader)))
 
 
-class Loss(torch.autograd):
+class Loss(torch.autograd.Function):
 
-    def __init__(self, margin, k, alpha, beta):
-        super(Loss, self).__init__()
-        self.margin = margin
-        self.k = k
-        self.alpha = alpha
-        self.beta = beta
+   # def __init__(self, margin, k, alpha, beta):
+   #     super(Loss, self).__init__()
+   #     self.save_margin = margin
+   #     self.k = k
+   #     self.alpha = alpha
+   #     self.beta = beta
 
-    def forward(self, y, target):
+    def forward(self, y, target, k, a, m):
         """
         custom loss function - implementation in numpy
 
@@ -57,26 +56,30 @@ class Loss(torch.autograd):
         Outputs: 
             loss - the loss between y and target
         """
-        # store the predicted values so we can use the size for the gradient computation
-        self.pred = y
-        self.in_data = y
-        self.target = target
-
-        # taken from function on rangeloss implementation
-
+        self.save_for_backward(k, a, m, y, target)
+        b = 1.0 - a
+        
         # convert the data into numpy arrays so they can be manipulated accordingly
-        features = y.data.numpy()
-        labels = target.data.numpy()
+        features = y.numpy()
+        labels = target.numpy()
+
+        # fix this!!
+        loss, counts, centers, l_intra, inter_indices, l_inter, d = self.compute_loss(features, labels, k.numpy(), a.numpy(), b.numpy(), m.numpy())
+
+        # compute the loss
+        loss_autograd = torch.autograd.Variable(torch.from_numpy(np.array([loss])), requires_grad=True)
+        # do i need to clone the output???
+        return loss_autograd.data
+
+    def compute_loss(self, features, labels, k, a, b, m):
 
         # count the number of class labels and the number of data per class label
         unique_labels, counts = np.unique(labels, return_counts=True)
-        self.counts = counts
 
         # store the centers for each class (mean of data)
         centers = np.zeros((unique_labels.shape[0], features.shape[1]))
-        self.centers = centers
         # find the top k Euclidean distances for each class
-        d = np.zeros((unique_labels.shape[0], self.k))
+        d = np.zeros((unique_labels.shape[0], k[0]))
 
         # initialize the harmonic mean (intra-class loss) for each class
         l_r = np.zeros((unique_labels.shape[0]))
@@ -89,33 +92,28 @@ class Loss(torch.autograd):
             # compute the centers (means)
             centers[idx, :] = np.mean(features_l, axis=0)
             # compute the top k Euclidean distances
-            d[idx, :] = self.compute_top_k(features_l)
+            d[idx, :] = self.compute_top_k(features_l, k[0])
             # compute the harmonic mean, intra-class loss
-            l_r[idx] = self.k / np.sum(d[idx, :])
+            l_r[idx] = k[0] / np.sum(d[idx, :])
 
         # compute total intra-class loss
         l_intra = np.sum(l_r)
-        self.l_intra = l_intra
         # compute the shortest distances among all feature centers
-        d_center, idx = self.compute_min_dist(centers)
-        self.inter_indices = idx
+        d_center, inter_indices = self.compute_min_dist(centers)
         # compute total inter-class loss
-        l_inter = max(self.margin - d_center, 0)
-        self.l_inter = l_inter
+        l_inter = max(m[0] - d_center, 0)
         # combine these together for the total loss
-        loss = l_intra * self.alpha + l_inter * self.beta
+        loss = l_intra * a[0] + l_inter * b[0]
         #self.assign(out_data[0], req[0], mx.nd.array(loss))
+        
+        return loss, counts, centers, l_intra, inter_indices, l_inter, d
 
-        # compute the loss
-        loss_autograd = torch.autograd.Variable(torch.from_numpy(np.array([loss])), requires_grad=True)
-        return loss_autograd
 
-    def compute_top_k(self, features):
+    def compute_top_k(self, features, k):
 
         # this can probably be done faster in a list comprehension
 
         # initialize an array of zeros and fill in pairwise distances
-        top_indices = np.zeros(
         num = features.shape[0]
         dists = np.zeros((num, num))
         for id_1 in range(num):
@@ -126,7 +124,7 @@ class Loss(torch.autograd):
         # reshape the array to be 1D
         dist_array = dists.reshape((-1, ))
         dist_array.sort()
-        return dist_array[-self.k:]
+        return dist_array[-k:]
 
     def compute_min_dist(self, centers):
 
@@ -158,35 +156,48 @@ class Loss(torch.autograd):
         """
 
         # *********************************************
-        # why isn't backward being called?????*********
-        # *********************************************
-
-
-        # *********************************************
         # check this with torch.autograd.gradcheck !!!!
         # *********************************************
 
-        grad_inter = torch.FloatTensor(self.pred.size())
-        grad_intra = torch.FloatTensor(self.pred.size())
+        k, a, m, y, targets = self.saved_tensors
+        b = 1.0 - a
 
-        inter_indices = self.inter_indices
-        print(inter_indices.shape)
+        features = y.numpy()
+        labels = targets.numpy()
+
+        loss, counts, centers, l_intra, inter_indices, l_inter, d = self.compute_loss(features, labels, k.numpy(), a.numpy(), b.numpy(), m.numpy())
+
+        grad_inter = torch.FloatTensor(y.size())
+        grad_intra = torch.FloatTensor(y.size())
+
         idx1 = inter_indices[0]
         idx2 = inter_indices[1]
-        grad_inter[idx1] = 0.5 / (self.counts[idx1]) * np.abs(self.centers[idx1] - self.centers[idx2])
-        grad_inter[idx2] = 0.5 / (self.counts[idx2]) * np.abs(self.centers[idx2] - self.centers[idx1])
+        grad_inter[idx1] = torch.from_numpy(0.5 / (counts[idx1]) * np.abs(centers[idx1] - centers[idx2]))
+        grad_inter[idx2] = torch.from_numpy(0.5 / (counts[idx2]) * np.abs(centers[idx2] - centers[idx1]))
 
         # compute intra class gradients with respect to xi, xj
         # only nonzero for these two values
-        for idx in range(self.num_features):
-            grad_in[idx] = 2*self.k / np.pow(d[idx,:]*np.sum(d[idx,:]))
+
+        # *********************************************************
+        # HOW TO COMPUTE GRADIENTS WITH RESPECT TO MULTIPLE SAMPLES
+        # WHEN LOSS IS JUST COMPUTED OVERALL????
+        # *********************************************************
+
+        for idx in range(y.size()[1]):
+            denom = np.array([np.power(d[idx,0]*np.sum(d[idx,:]),2)])
+            grad = 2*k.double() / torch.from_numpy(denom)
+            for entry in range(y.size()[0]):
+                grad_intra[entry, idx] = grad[0]
 
         # compute inter class gradients with respect to xq, xr
         # only nonzero for these two values
 
-        grad_in = self.alpha * grad_intra + self.beta * grad_inter
+        # ****************************************
+        # SOMEHOW THE GRADIENT IS WAY TOO BIG ****
+        # ****************************************
+        grad_in = a*grad_intra + b*grad_inter
         print(grad_in)
-        return grad_in
+        return grad_in, torch.DoubleTensor([0]), torch.DoubleTensor([0]), torch.DoubleTensor([0]), torch.DoubleTensor([0])
 
     def name(self):
         return "rangeloss"
@@ -203,9 +214,9 @@ class CustomNetwork(nn.Module):
         self.fc1 = nn.Linear(28*28, 500)
         self.fc2 = nn.Linear(500, 256)
         self.fc3 = nn.Linear(256, 10)
-        self.loss = Loss(MARGIN, K, ALPHA, BETA)
+        self.loss = Loss()
 
-    def forward(self, x, target):
+    def forward(self, x, target, k, a, m):
         """
         implement the forward pass of network
            backward pass handled by pytorch
@@ -214,8 +225,7 @@ class CustomNetwork(nn.Module):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
         y = F.relu(self.fc3(x))
-        loss = self.loss(y, target)
-        #print("sizes - ", "pred: ", y.size(), ", target: ", target.size())
+        loss = self.loss(y, target, k, a, m)
         return y, loss
 
     def name(self):
@@ -225,7 +235,7 @@ class CustomNetwork(nn.Module):
 model = CustomNetwork()
 
 # define the optimizer to use, pass in model
-optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
+optimizer = optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
 for epoch in range(10):
 
     # trainning
@@ -235,9 +245,9 @@ for epoch in range(10):
         # load data
         x, target = Variable(x, requires_grad=True), Variable(target, requires_grad=True)
         # perform prediction
-        _, loss = model(x, target)
+        _, loss = model(x, target, K, ALPHA, MARGIN)
         # let pytorch train model
-        loss.backward()
+        loss.backward(retain_graph=True)
         optimizer.step()
         # print out updates
         if batch_idx % 100 == 0:
@@ -248,7 +258,7 @@ for epoch in range(10):
     correct_cnt, ave_loss = 0, 0
     for batch_idx, (x, target) in enumerate(test_loader):
         x, target = Variable(x, volatile=True), Variable(target, volatile=True)
-        score, loss = model(x, target)
+        score, loss = model(x, target, K, ALPHA, MARGIN)
         _, pred_label = torch.max(score.data, 1)
         correct_cnt += (pred_label == target.data).sum()
         ave_loss += loss.data[0]
